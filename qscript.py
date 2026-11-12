@@ -192,17 +192,10 @@ def CaptureVideo_Magento(
             for character in query:
                 page.keyboard.type(character, delay=85)
 
-            search_button = page.locator('form button[type="submit"]').first
-            search_button.wait_for(state="visible", timeout=15000)
-            button_box = search_button.bounding_box()
-            if button_box:
-                _smooth_move(
-                    page,
-                    button_box["x"] + button_box["width"] / 2,
-                    button_box["y"] + button_box["height"] / 2,
-                    steps=20,
-                )
-            search_button.click()
+            # DuckDuckGo may keep an inactive/hidden submit button in the DOM
+            # (for example, its AI search widget). Submit the actual search field
+            # with Enter instead of selecting the first form submit button.
+            search_box.press("Enter")
 
            
             results = page.locator('a[data-testid="result-title-a"]')
