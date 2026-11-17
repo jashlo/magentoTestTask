@@ -166,7 +166,7 @@ def CaptureVideo_Magento(
 
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(headless=True)
+            browser = playwright.chromium.launch(headless=False)
             context = browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 record_video_dir=str(temporary_dir),

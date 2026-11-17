@@ -1,54 +1,68 @@
-"""Flask service for uploading, looking up, and serving recorded videos."""
+"""Flask video service backed by PostgreSQL; intended to run under Apache/mod_wsgi."""
 import os
 import re
-import sqlite3
-from contextlib import contextmanager
+import time
 from pathlib import Path
 
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from flask import Flask, jsonify, request, send_from_directory
 
 BASE_DIR = Path(__file__).resolve().parent
-UPLOAD_DIR = BASE_DIR / "uploads"
-DATABASE_PATH = BASE_DIR / "videos.db"
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", str(BASE_DIR / "uploads"))).resolve()
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 500 * 1024 * 1024
 
 
-def get_db():
-    connection = sqlite3.connect(str(DATABASE_PATH), timeout=30)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 30000")
-    return connection
+def db_config():
+    """Read database settings only from environment variables."""
+    return {
+        "host": os.environ.get("DB_HOST", "db"),
+        "port": int(os.environ.get("DB_PORT", "5432")),
+        "dbname": os.environ.get("DB_NAME", "videos"),
+        "user": os.environ.get("DB_USER", "video_user"),
+        "password": os.environ.get("DB_PASSWORD", "video_pass"),
+        "connect_timeout": 5,
+    }
 
 
-@contextmanager
-def db_connection():
-    connection = get_db()
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+def get_db_connection():
+    return psycopg2.connect(**db_config(), cursor_factory=RealDictCursor)
 
 
 def init_db():
-    with db_connection() as connection:
-        connection.execute("PRAGMA journal_mode = WAL")
-        connection.execute("""
-            CREATE TABLE IF NOT EXISTS videos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_name TEXT NOT NULL UNIQUE,
-                file_path TEXT NOT NULL,
-                video_url TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            )
-        """)
+    """Wait for PostgreSQL, then create the table before Apache serves requests."""
+    attempts = int(os.environ.get("DB_CONNECT_ATTEMPTS", "30"))
+    delay = float(os.environ.get("DB_CONNECT_DELAY", "2"))
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        connection = None
+        try:
+            connection = get_db_connection()
+            with connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("""
+                        CREATE TABLE IF NOT EXISTS videos (
+                            id BIGSERIAL PRIMARY KEY,
+                            company_name TEXT NOT NULL UNIQUE,
+                            file_path TEXT NOT NULL,
+                            video_url TEXT NOT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        )
+                    """)
+            return
+        except psycopg2.Error as exc:
+            last_error = exc
+            app.logger.warning("PostgreSQL not ready (attempt %s/%s): %s", attempt, attempts, exc)
+            if attempt < attempts:
+                time.sleep(delay)
+        finally:
+            if connection is not None:
+                connection.close()
+    raise RuntimeError("Could not connect to PostgreSQL after {} attempts: {}".format(attempts, last_error))
 
 
 def safe_company_filename(company_name):
@@ -77,15 +91,21 @@ def upload_video():
     uploaded_file.save(str(destination))
     absolute_path = str(destination.resolve())
     video_url = request.host_url.rstrip("/") + "/media/" + filename
-    with db_connection() as connection:
-        connection.execute("""
-            INSERT INTO videos (company_name, file_path, video_url)
-            VALUES (?, ?, ?)
-            ON CONFLICT(company_name) DO UPDATE SET
-                file_path = excluded.file_path,
-                video_url = excluded.video_url,
-                updated_at = datetime('now')
-        """, (company_name, absolute_path, video_url))
+
+    connection = get_db_connection()
+    try:
+        with connection:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    INSERT INTO videos (company_name, file_path, video_url)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (company_name) DO UPDATE SET
+                        file_path = EXCLUDED.file_path,
+                        video_url = EXCLUDED.video_url,
+                        updated_at = NOW()
+                """, (company_name, absolute_path, video_url))
+    finally:
+        connection.close()
     return jsonify({"company_name": company_name, "video_url": video_url}), 200
 
 
@@ -94,11 +114,16 @@ def get_video_url():
     company_name = (request.args.get("company_name") or "").strip()
     if not company_name:
         return jsonify({"error": "company_name query parameter is required."}), 400
-    with db_connection() as connection:
-        record = connection.execute(
-            "SELECT company_name, video_url FROM videos WHERE company_name = ?",
-            (company_name,),
-        ).fetchone()
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT company_name, video_url FROM videos WHERE company_name = %s",
+                (company_name,),
+            )
+            record = cursor.fetchone()
+    finally:
+        connection.close()
     if record is None:
         return jsonify({"error": "Video not found.", "company_name": company_name}), 404
     return jsonify({"company_name": record["company_name"], "video_url": record["video_url"]}), 200
@@ -111,18 +136,18 @@ def serve_video(filename):
 
 @app.get("/videos")
 def list_videos():
-    with db_connection() as connection:
-        records = connection.execute(
-            "SELECT company_name, file_path, video_url, created_at, updated_at "
-            "FROM videos ORDER BY company_name"
-        ).fetchall()
+    connection = get_db_connection()
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("""
+                SELECT company_name, file_path, video_url, created_at, updated_at
+                FROM videos ORDER BY company_name
+            """)
+            records = cursor.fetchall()
+    finally:
+        connection.close()
     return jsonify([dict(record) for record in records]), 200
 
 
-if __name__ == "__main__":
-    init_db()
-    app.run(
-        host=os.environ.get("FLASK_HOST", "0.0.0.0"),
-        port=int(os.environ.get("FLASK_PORT", "8000")),
-        threaded=True,
-    )
+# mod_wsgi imports this module when Apache starts. Do not initialize a local SQLite DB.
+init_db()
